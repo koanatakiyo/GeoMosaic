@@ -1,0 +1,64 @@
+# Copy to APIs/llm.yaml and fill values locally. APIs/llm.yaml is git-ignored.
+
+openai:
+  provider: openai
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  api_key: ""
+  model:
+    text: gpt-5-mini
+    vision: gpt-5-mini
+  generation:
+    temperature: 0.1
+
+gemini:
+  provider: gemini
+  api_key_env: GEMINI_API_KEY
+  api_key: ""
+  fallback_api_keys: []
+  model: gemini-2.5-flash
+  rate_limit:
+    rpd_limit: 0
+  generation:
+    temperature: 0.1
+
+grok:
+  api_key_env: XAI_API_KEY
+  api_key: ""
+  model: grok-4-1-fast-non-reasoning
+  base_url: https://api.x.ai/v1
+  timeout: 300
+
+deepseek:
+  provider: deepseek
+  api_key_env: DEEPSEEK_API_KEY
+  api_key: ""
+  model: deepseek-chat
+  base_url: https://api.deepseek.com/
+  generation:
+    temperature: 0.1
+
+qwen:
+  provider: dashscope
+  api_key_env: DASHSCOPE_API_KEY
+  api_key: ""
+  model: qwen-plus
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  extra_body:
+    enable_thinking: true
+
+doubao:
+  api_key_env: ARK_API_KEY
+  api_key: ""
+  model: doubao-seed-1-6-thinking-250715
+  base_url: https://ark.cn-beijing.volces.com/api/v3
+
+llama:
+  api_key_env: OPENROUTER_API_KEY
+  api_key: ""
+  fallback_api_keys: []
+  base_url: https://openrouter.ai/api/v1
+  model: meta-llama/llama-4-maverick:floor
+  extra_headers:
+    HTTP-Referer: https://your-site.example
+    X-Title: GeoMosaic

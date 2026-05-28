@@ -217,3 +217,11 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 geomosaic_hg_plan_v2.md
+
+.claude/
+.codex/
+data/
+docs/
+APIs/*
+!APIs/ACLED_api.example
+!APIs/llm.example.yaml
