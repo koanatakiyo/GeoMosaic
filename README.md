@@ -124,6 +124,23 @@ Frozen LLM sidecar plan:
 - ClaimEvidenceHyperedge rows are candidate/provenance structures unless explicitly human-verified. They express possible claim-evidence incidence for retrieval and audit, not verified support/contradict ground truth.
 - Main ICDE experiments remain SMPI/BPE retrieval, deterministic coverage/constraint metrics, and system-efficiency evaluation.
 
+Plan E4 direct-scoring tasks:
+
+```bash
+python3 script/plan_direct_scoring.py \
+  --output-dir data/1_intermediate/direct_scoring
+```
+
+Smoke-run one scorer before a full model pass:
+
+```bash
+python3 script/run_direct_scoring.py \
+  --model gemini \
+  --model-id gemini-2.5-pro \
+  --limit 1 \
+  --sleep-seconds 2
+```
+
 ## Retrieval
 
 `script/run_retrieval.py` loads the project-local tables into SMPI, applies temporal/primary-source/modality/primary-match-level/evidence-role/provenance filters, retrieves lexical seeds, expands through event/source/asset incidence lists, then runs Balanced Provenance Expansion over the capped coverage objective.
