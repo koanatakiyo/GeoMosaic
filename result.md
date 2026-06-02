@@ -444,6 +444,196 @@ Current metadata policy:
 }
 ```
 
+### Official Document Parsing Protocol
+
+Manual official-document materialization is treated as a reviewed input layer, not as a crawler output. Files are organized into `data/0_external/official_doc_materialized/` and parsed only through its manifest:
+
+```text
+data/0_external/official_doc_materialized/
+  files/{event}/
+  manual_text/{event}/
+  manifest.jsonl
+  summary.json
+```
+
+The parser is deterministic and model-independent:
+
+```bash
+python script/parse_official_docs.py \
+  --manifest data/0_external/official_doc_materialized/manifest.jsonl \
+  --output-dir data/0_external/official_doc_parsed \
+  --max-passage-chars 1800 \
+  --overlap-chars 150 \
+  --min-ok-chars 100
+```
+
+Output files:
+
+| File | Purpose |
+| --- | --- |
+| `official_doc_text.jsonl` | one parsed text record per manifest document |
+| `passages.jsonl` | overlapping passages with character offsets |
+| `parse_summary.json` | parse QA counts, warnings, and shortest-document checks |
+| `parse_qa_report.json` | deterministic Step 2 QA over parsed docs/passages |
+
+Schema notes:
+
+- `official_doc_text.jsonl` uses top-level `sha256` for the materialized source file hash; parser diagnostics such as `text_sha256`, `page_spans`, `expected_source_filename`, and parser warnings/errors live under `extra`.
+- `passages.jsonl` stores passage-level `text_sha256` under `extra`, not as a top-level field.
+- `passages.jsonl` uses globally unique IDs of the form `passage_{document_id}_{language}_{passage_index}`.
+- Each passage carries `page_start` and `page_end`; manually copied text files are treated as page `1`.
+
+Step 2 QA is deterministic and does not call an LLM:
+
+```bash
+python script/qa_official_doc_parse.py \
+  --parsed-dir data/0_external/official_doc_parsed \
+  --output data/0_external/official_doc_parsed/parse_qa_report.json
+```
+
+Latest parse QA:
+
+| Metric | Count |
+| --- | ---: |
+| manifest rows parsed | 111 |
+| PDF files parsed by `pdfminer.six` | 84 |
+| manual text files parsed | 27 |
+| documents `ok` | 111 |
+| documents `low_text` | 0 |
+| documents `failed` | 0 |
+| passages | 3790 |
+| total parsed characters | 5,466,035 |
+| min / max document characters | 518 / 1,446,106 |
+| duplicate `passage_id` rows | 0 |
+| passages missing `page_start` / `page_end` | 0 |
+| source `sha256` mismatches | 0 |
+| passage ID format violations | 0 |
+| page range mismatches from `extra.page_spans` | 0 |
+| QA errors | 0 |
+| QA warnings | 1 category: 5 short official-statement documents under 1,000 characters |
+
+LLM use starts after this deterministic text layer. We separate three roles and keep only the systems layer load-bearing for the ICDE main results:
+
+- Non-load-bearing metadata enrichment: summaries, actors, dates, language notes, section outlines, and candidate passage hints. These are versioned by `model_id`, prompt version, schema version, and input hash, but do not define benchmark ground truth.
+- Diagnostic triage: fixed claims plus deterministic top-k passages may be judged by LLMs to identify passage quality issues, retrieval failures, model disagreements, and language-retrieval failures. These judgments are not gold labels and do not support the main experimental claims.
+- Secondary direct scoring: D_SAS-MM validation follows the GeoGround direct-scoring protocol over document/evidence bundles. Long documents may use document-level map-reduce scoring, but the measurement unit remains the document/bundle rather than a claim-conditioned top-k passage set.
+
+Frozen sidecar protocol:
+
+```text
+Stage B:
+  model: Gemini 2.5 Flash
+  scope: non-load-bearing metadata only
+  outputs: summary, actors, dates, language_note, section_outline,
+           candidate_passage_hints
+  hard boundary: Stage B outputs never enter diagnostic triage,
+                 direct scoring, or main metrics
+
+Stage C:
+  status: diagnostic triage only
+  input: fixed claims + deterministic top-k passage retrieval over parsed text
+  use: passage_quality_issue / retrieval_failure / model_disagreement /
+       language_retrieval_failure diagnostics
+  non-use: not ground truth; not used for main E1-E3 conclusions
+
+E4:
+  status: secondary validation
+  protocol: GeoGround-style direct scoring over document/evidence bundles
+  scorers: independent scorer models report D_SAS-MM sensitivity
+```
+
+This freezes LLM use as a sidecar. The paper main line remains SMPI/BPE retrieval, deterministic coverage/constraint metrics, and systems-efficiency evaluation. Stage C outputs are retained as diagnostics, while verified grounding claims are limited to explicitly human-audited subsets.
+
+Step 3 dry run plans only the first role and makes no LLM calls:
+
+```bash
+python script/plan_metadata_extraction.py \
+  --parsed-dir data/0_external/official_doc_parsed \
+  --external-assets data/0_external/external_assets.jsonl \
+  --output-dir data/1_intermediate/metadata_extraction \
+  --model-id gemini-2.5-flash \
+  --dry-run
+```
+
+Current dry-run outputs:
+
+| File | Purpose |
+| --- | --- |
+| `data/1_intermediate/metadata_extraction/metadata_extraction_tasks.jsonl` | one planned non-load-bearing extraction task per parsed official document |
+| `data/1_intermediate/metadata_extraction/metadata_extraction_dry_run_summary.json` | task counts, batching strategy, and pointer skip diagnostics |
+
+Dry-run result:
+
+| Metric | Count |
+| --- | ---: |
+| official documents planned | 111 |
+| LLM calls made | 0 |
+| planned extraction batches | 244 |
+| full-text tasks | 97 |
+| passage-map-reduce tasks | 14 |
+| pointer assets skipped | 29 |
+| skipped `news_pointer` rows | 23 |
+| skipped `map_pointer` rows | 6 |
+
+The planner deliberately skips pointer assets, including GDELT DOC article pointers and Visual GKG/social-image restricted pointers. These records already carry pointer metadata and do not require text extraction.
+
+Step 4 executes Stage B as a sidecar, still restricted to non-load-bearing metadata:
+
+```bash
+python script/extract_official_doc_metadata.py \
+  --limit 3 \
+  --overwrite \
+  --project "$GOOGLE_CLOUD_PROJECT" \
+  --sleep-seconds 1
+```
+
+After the trial run succeeds, run the full resumable pass:
+
+```bash
+python script/extract_official_doc_metadata.py \
+  --model-id gemini-2.5-flash \
+  --resume \
+  --project "$GOOGLE_CLOUD_PROJECT" \
+  --sleep-seconds 1
+```
+
+Execution outputs:
+
+| File | Purpose |
+| --- | --- |
+| `data/1_intermediate/metadata_extraction/official_doc_metadata_enrichment.jsonl` | one Stage B metadata sidecar row per official document task |
+| `data/1_intermediate/metadata_extraction/official_doc_metadata_batch_outputs.jsonl` | batch-level intermediate rows for long documents |
+| `data/1_intermediate/metadata_extraction/official_doc_metadata_enrichment_summary.json` | attempted/completed/failed counts and LLM-call count |
+
+The executor enforces the Stage B/Stage C boundary in the artifact itself: every row is written with `load_bearing=false`, `stage_c_excluded=true`, and `stage_c_policy=never_use_stage_b_outputs`. Its schema accepts only `summary`, `actors`, `dates`, `language_note`, `section_outline`, and `candidate_passage_hints`; load-bearing fields such as `document_position`, support/contradict labels, and claim-grounding decisions are discarded if a model returns them.
+
+Latest Stage B completion status:
+
+| Metric | Value |
+| --- | ---: |
+| document-level metadata rows | 111 |
+| completed rows | 111 |
+| failed rows | 0 |
+| long-document batch rows | 147 |
+| SCS arbitration batches | 47/47 |
+| SCS arbitration final reduce | Gemini reduce, `llm_calls=48` |
+
+The final SCS arbitration task was rerun with a selected-task execution and `max_output_tokens=40000`; it replaced the earlier deterministic fallback with a successful Gemini reduce while preserving `prompt_version=official_doc_metadata_v0`.
+
+Paper wording:
+
+```text
+Official-document text is produced by a deterministic parsing layer before any
+LLM-assisted annotation. Manual materialization is recorded in a manifest, and
+only manifest-listed files are parsed. LLM enrichment is split into
+non-load-bearing metadata extraction, diagnostic passage-level triage, and
+GeoGround-style direct scoring. Stage B metadata and Stage C triage outputs do
+not define benchmark ground truth or main system metrics. Stage C is used to
+identify passage-quality and retrieval-failure cases for audit; direct-scoring
+results are reported only as secondary validation over fixed document/evidence
+bundles.
+```
+
 For multilingual official documents, the default benchmark activates one representative row per `document_group_id` when possible, normally the `download_priority=true` language variant. Other official language variants are retained in metadata through `available_languages_known_to_have`, `language_role`, `authoritative_status`, and `url_resolver`, but are not counted as separate official evidence rows in the default evaluation.
 
 Language-code convention for the reviewed official-document catalog:
@@ -507,7 +697,7 @@ Implemented a first GDELT connector as a pointer adapter:
 - `script/geomosaic_hg/clients/gdelt.py`
 - `script/fetch_gdelt_doc_assets.py`
 
-The current adapter targets GDELT DOC 2.0 and writes news/article pointer assets:
+The current adapter targets GDELT DOC 2.0 and writes pointer assets only:
 
 ```json
 {
@@ -524,7 +714,24 @@ The current adapter targets GDELT DOC 2.0 and writes news/article pointer assets
 }
 ```
 
-This intentionally does not treat GDELT DOC as an ACLED replacement. GDELT DOC is a full-text news search surface; CAMEO-style structured events should be handled by a later `GDELT_EVENTS` adapter. For events before the DOC search horizon, the fetch script marks default rows as `temporal_relation = "retrospective_recent"` rather than event-window evidence.
+If a DOC article carries Visual GKG/social-image metadata, the fetcher emits a second restricted image pointer:
+
+```json
+{
+  "asset_source": "GDELT_DOC",
+  "modality": "image_restricted_pointer",
+  "source_layer": "news",
+  "redistribution_flag": false,
+  "extra": {
+    "collection_channel": "gdelt_doc_visual_gkg",
+    "record_type": "image_restricted_pointer",
+    "curation_level": "machine_indexed_image_pointer",
+    "active_policy": "pointer_enrichment"
+  }
+}
+```
+
+This intentionally does not treat GDELT DOC as an ACLED replacement. GDELT DOC is a full-text news/search and visual-metadata surface; CAMEO-style structured events should be handled by a later `GDELT_EVENTS` adapter. Hong Kong 2020 and Ukraine 2022 are marked as `source_temporal_coverage = "event_window"` by default. Iraq 2003, Kosovo 2008, Libya 2011, Crimea 2014, JCPOA 2015, and SCS 2016 are marked as `source_temporal_coverage = "retrospective_context"` rather than event-window evidence.
 
 Implemented event-scoped retrieval:
 

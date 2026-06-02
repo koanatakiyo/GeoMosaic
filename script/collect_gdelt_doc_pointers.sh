@@ -5,13 +5,15 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_root"
 
 python_bin="${PYTHON_BIN:-python}"
-events_csv="hongkong,ukraine"
+events_csv="crimea,iraq,libya,kosovo,scs,jcpoa,hongkong,ukraine"
 max_records=50
 window_days=14
 sleep_seconds=6
 gdelt_delay_seconds=5
 gdelt_retries=4
 gdelt_retry_backoff_seconds=15
+gdelt_timeout_seconds=30
+gdelt_sort="hybridrel"
 output_dir="data/0_external/external_asset_raw"
 dry_run=0
 merge_after=0
@@ -23,9 +25,8 @@ Usage: script/collect_gdelt_doc_pointers.sh [options]
 
 Sequentially collect GDELT DOC article pointers with conservative spacing.
 
-Default events are hongkong,ukraine because GDELT DOC supports event-window
-coverage for these recent events. Use --all-events to also collect
-retrospective pointers for older events.
+Default events are all eight Tier-1 events. Each event is collected with
+event-window coverage around its anchor date.
 
 Options:
   --events CSV                       Event ids to collect.
@@ -34,8 +35,10 @@ Options:
   --window-days N                    Event-window radius for recent events. Default: 14
   --sleep-seconds N                  Sleep between event commands. Default: 6
   --gdelt-delay-seconds N            In-process GDELT delay. Default: 5
-  --gdelt-retries N                  Retries for HTTP 429. Default: 4
-  --gdelt-retry-backoff-seconds N    Initial retry backoff for HTTP 429. Default: 15
+  --gdelt-retries N                  Retries for transient GDELT errors. Default: 4
+  --gdelt-retry-backoff-seconds N    Initial retry backoff for transient GDELT errors. Default: 15
+  --gdelt-timeout-seconds N          Per-request GDELT timeout. Default: 30
+  --gdelt-sort SORT                  GDELT DOC sort mode. Default: hybridrel
   --output-dir DIR                   Raw output directory. Default: data/0_external/external_asset_raw
   --merge-after                      Rebuild data/0_external/external_assets.jsonl after collection.
   --dry-run                          Print commands without executing them.
@@ -91,6 +94,14 @@ while [[ $# -gt 0 ]]; do
       gdelt_retry_backoff_seconds="$2"
       shift 2
       ;;
+    --gdelt-timeout-seconds)
+      gdelt_timeout_seconds="$2"
+      shift 2
+      ;;
+    --gdelt-sort)
+      gdelt_sort="$2"
+      shift 2
+      ;;
     --output-dir)
       output_dir="$2"
       shift 2
@@ -128,6 +139,8 @@ for index in "${!events[@]}"; do
     --gdelt-delay-seconds "$gdelt_delay_seconds" \
     --gdelt-retries "$gdelt_retries" \
     --gdelt-retry-backoff-seconds "$gdelt_retry_backoff_seconds" \
+    --gdelt-timeout-seconds "$gdelt_timeout_seconds" \
+    --sort "$gdelt_sort" \
     --output "$output_path"; then
     echo "warning: GDELT DOC collection failed for event=${event}; continuing." >&2
     failed_events+=("$event")

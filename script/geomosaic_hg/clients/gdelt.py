@@ -25,12 +25,15 @@ class GDELTDOCClient:
         rate_limit_seconds: float = 5.0,
         max_retries: int = 2,
         retry_backoff_seconds: float = 10.0,
+        invalid_json_as_empty: bool = True,
     ) -> None:
         self.api_url = api_url
         self.timeout = timeout
         self.rate_limit_seconds = max(0.0, rate_limit_seconds)
         self.max_retries = max(0, max_retries)
         self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
+        self.invalid_json_as_empty = invalid_json_as_empty
+        self.last_empty_reason: str | None = None
         self._last_request_at = 0.0
 
     def _respect_rate_limit(self) -> None:
@@ -42,11 +45,20 @@ class GDELTDOCClient:
             time.sleep(wait_seconds)
 
     def _is_retryable_error(self, exc: HTTPClientError) -> bool:
+        message = str(exc)
+        if message.startswith("Invalid JSON response"):
+            return True
         if exc.status in {408, 425, 429, 500, 502, 503, 504}:
             return True
-        return exc.status is None and str(exc).startswith("Request failed")
+        if exc.status is not None:
+            return False
+        return message.startswith("Request failed")
+
+    def _is_invalid_json_error(self, exc: HTTPClientError) -> bool:
+        return str(exc).startswith("Invalid JSON response")
 
     def _get_json_with_retry(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.last_empty_reason = None
         for attempt in range(self.max_retries + 1):
             self._respect_rate_limit()
             try:
@@ -56,6 +68,9 @@ class GDELTDOCClient:
             except HTTPClientError as exc:
                 self._last_request_at = time.monotonic()
                 if not self._is_retryable_error(exc) or attempt >= self.max_retries:
+                    if self.invalid_json_as_empty and self._is_invalid_json_error(exc):
+                        self.last_empty_reason = str(exc)
+                        return {"articles": []}
                     raise
                 wait_seconds = self.retry_backoff_seconds * (2**attempt)
                 time.sleep(wait_seconds)
@@ -147,6 +162,66 @@ def gdelt_doc_article_to_asset(
             "language": language,
             "sourcecountry": source_country,
             "socialimage": article.get("socialimage", ""),
+            "gdelt_doc": article,
+        },
+    )
+
+
+def gdelt_doc_article_to_image_asset(
+    article: dict[str, Any],
+    event_id: str,
+    query: str,
+    temporal_relation: str = "unknown",
+) -> EvidenceAsset | None:
+    """Convert GDELT DOC socialimage/Visual GKG metadata into a restricted image pointer."""
+    image_url = str(article.get("socialimage") or "").strip()
+    if not image_url:
+        return None
+
+    info = EVENTS[event_id]
+    article_url = str(article.get("url") or article.get("url_mobile") or "")
+    title = str(article.get("title") or article_url or "GDELT DOC visual pointer")
+    seendate = gdelt_seen_date_to_iso(str(article.get("seendate", "")), info.publish_time)
+    domain = str(article.get("domain") or "")
+    language = str(article.get("language") or "")
+    source_country = str(article.get("sourcecountry") or "")
+    text = f"Restricted image pointer from GDELT DOC Visual GKG metadata for article: {title}."
+    asset_id = f"asset_gdelt_visual_{event_id}_{stable_hash('|'.join([image_url, article_url, title]))}"
+    return EvidenceAsset(
+        asset_id=asset_id,
+        event_id=event_id,
+        modality="image_restricted_pointer",
+        asset_source="GDELT_DOC",
+        source_layer="news",
+        viewpoint_origin=source_country or "news_aggregate",
+        publish_time=seendate,
+        observed_time=seendate,
+        geo_location=info.geo_location,
+        url_or_pointer=image_url,
+        caption_or_transcript=text,
+        license_or_terms="Restricted image pointer from GDELT DOC/Visual GKG metadata; original publisher terms apply",
+        redistribution_flag=False,
+        perceptual_hash=sha256_text("|".join([image_url, article_url, title, seendate])),
+        embedding_id=f"emb_{asset_id}",
+        extracted_entities=[info.subject, title, domain],
+        extracted_claims=[],
+        evidence_role="context",
+        extra={
+            "collection_channel": "gdelt_doc_visual_gkg",
+            "record_type": "image_restricted_pointer",
+            "curation_level": "machine_indexed_image_pointer",
+            "source_temporal_coverage": temporal_relation,
+            "active_policy": "pointer_enrichment",
+            "active_bench": True,
+            "active_status": "active",
+            "temporal_relation": temporal_relation,
+            "query": query,
+            "domain": domain,
+            "language": language,
+            "sourcecountry": source_country,
+            "article_url": article_url,
+            "article_title": title,
+            "socialimage": image_url,
             "gdelt_doc": article,
         },
     )

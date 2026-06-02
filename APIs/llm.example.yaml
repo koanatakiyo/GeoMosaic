@@ -13,10 +13,17 @@ openai:
 
 gemini:
   provider: gemini
+  vertexai: true
+  project: ""
+  location: ""
+  api_version: ""
   api_key_env: GEMINI_API_KEY
   api_key: ""
   fallback_api_keys: []
-  model: gemini-2.5-flash
+  model: gemini_flash
+  models:
+    gemini_flash: gemini-2.5-flash
+    gemini_pro: gemini-2.5-pro
   rate_limit:
     rpd_limit: 0
   generation:

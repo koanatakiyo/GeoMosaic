@@ -225,3 +225,9 @@ docs/
 APIs/*
 !APIs/ACLED_api.example
 !APIs/llm.example.yaml
+
+script/vertex_gemini_smoke.py
+tests/test_llm_manager_vertex_gemini.py
+result.md
+script/collect_gdelt_doc_pointers.sh
+script/run_gdelt_doc_overnight.sh

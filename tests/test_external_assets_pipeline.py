@@ -140,6 +140,52 @@ class ExternalAssetsPipelineTest(unittest.TestCase):
             errors = validate_core_tables(tables)
             self.assertFalse([error for error in errors if error.startswith("evidence_assets:")])
 
+    def test_collect_existing_external_assets_skips_stale_archive_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / "raw"
+            stale = raw / "_stale_gdelt_doc"
+            stale.mkdir(parents=True)
+            current_asset = {
+                "asset_id": "asset_gdelt_doc_crimea_current",
+                "event_id": "crimea",
+                "modality": "text",
+                "asset_source": "GDELT_DOC",
+                "source_layer": "news",
+                "viewpoint_origin": "Ukraine",
+                "publish_time": "2014-03-16T00:00:00Z",
+                "observed_time": "2014-03-16T00:00:00Z",
+                "geo_location": "Crimea, Ukraine",
+                "url_or_pointer": "https://example.test/current",
+                "caption_or_transcript": "Current event-window pointer.",
+                "license_or_terms": "GDELT DOC pointer; original publisher terms apply",
+                "redistribution_flag": False,
+                "perceptual_hash": "currenthash",
+                "embedding_id": "emb_asset_gdelt_doc_crimea_current",
+                "extracted_entities": ["Crimea"],
+                "extracted_claims": [],
+                "evidence_role": "context",
+                "extra": {"temporal_relation": "event_window"},
+            }
+            stale_asset = {
+                **current_asset,
+                "asset_id": "asset_gdelt_doc_crimea_stale",
+                "url_or_pointer": "https://example.test/stale",
+                "perceptual_hash": "stalehash",
+                "embedding_id": "emb_asset_gdelt_doc_crimea_stale",
+                "extra": {"temporal_relation": "retrospective_context"},
+            }
+            (raw / "gdelt_doc_crimea.jsonl").write_text(json.dumps(current_asset) + "\n", encoding="utf-8")
+            (stale / "gdelt_doc_crimea.jsonl").write_text(json.dumps(stale_asset) + "\n", encoding="utf-8")
+
+            merged = root / "merged.jsonl"
+            summary = collect_existing_external_assets(raw, merged, {"crimea"})
+
+            rows = [json.loads(line) for line in merged.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([row["asset_id"] for row in rows], ["asset_gdelt_doc_crimea_current"])
+            self.assertEqual(summary["counts"]["merged_assets"], 1)
+            self.assertFalse(any("_stale_gdelt_doc" in path for path in summary["input_files"]))
+
     def test_collect_existing_writes_candidate_inventory_and_active_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

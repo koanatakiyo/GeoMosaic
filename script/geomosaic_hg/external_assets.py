@@ -758,6 +758,14 @@ def write_wikimedia_image_manifest(rows: list[dict[str, Any]], image_dir: Path) 
     return manifest_path
 
 
+def is_archived_external_asset_raw_path(path: Path, input_dir: Path) -> bool:
+    try:
+        relative = path.relative_to(input_dir)
+    except ValueError:
+        relative = path
+    return any(part.startswith(("_stale", "_archive")) for part in relative.parts[:-1])
+
+
 def collect_existing_external_assets(
     input_dir: Path,
     merged_output: Path,
@@ -780,6 +788,8 @@ def collect_existing_external_assets(
     warnings: list[dict[str, Any]] = []
     for path in sorted(input_dir.rglob("*.jsonl")):
         if path.resolve() == merged_output.resolve():
+            continue
+        if is_archived_external_asset_raw_path(path, input_dir):
             continue
         file_rows = []
         for row in read_jsonl(path):

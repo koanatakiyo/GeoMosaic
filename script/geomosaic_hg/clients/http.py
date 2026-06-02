@@ -22,9 +22,10 @@ class HTTPResponse:
 
 
 class HTTPClientError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None) -> None:
+    def __init__(self, message: str, status: int | None = None, body_preview: str = "") -> None:
         super().__init__(message)
         self.status = status
+        self.body_preview = body_preview
 
 
 def _escape_invalid_json_backslashes(text: str) -> str:
@@ -59,17 +60,22 @@ def get_json(base_url: str, params: dict[str, Any] | None = None, headers: dict[
     query = urlencode(params, doseq=True)
     url = f"{base_url}?{query}" if query else base_url
     request = Request(url, headers={"User-Agent": DEFAULT_USER_AGENT, **(headers or {})})
+    body = ""
+    status: int | None = None
     try:
         with urlopen(request, timeout=timeout) as response:
+            status = response.status
             body = response.read().decode("utf-8")
-            return HTTPResponse(url=url, status=response.status, data=load_json_lenient(body))
+            return HTTPResponse(url=url, status=status, data=load_json_lenient(body))
     except HTTPError as exc:
         text = exc.read().decode("utf-8", errors="replace")
-        raise HTTPClientError(f"HTTP {exc.code} for {url}: {text[:500]}", status=exc.code) from exc
+        preview = text[:500]
+        raise HTTPClientError(f"HTTP {exc.code} for {url}: {preview}", status=exc.code, body_preview=preview) from exc
     except URLError as exc:
         raise HTTPClientError(f"Request failed for {url}: {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise HTTPClientError(f"Invalid JSON response from {url}: {exc}") from exc
+        preview = body[:500]
+        raise HTTPClientError(f"Invalid JSON response from {url}: {exc}; response_preview={preview!r}", status=status, body_preview=preview) from exc
 
 
 def post_form_json(base_url: str, data: dict[str, Any], headers: dict[str, str] | None = None, timeout: int = 30) -> HTTPResponse:

@@ -26,6 +26,13 @@ _RETRY_DELAY_PATTERNS = (
     re.compile(r"retrydelay['\"]?\s*:\s*['\"]([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE),
 )
 
+VERTEX_PROJECT = "project-c4865349-a336-4706-8ca"
+VERTEX_LOCATION = "us-central1"
+MODELS = {
+    "gemini_flash": "gemini-2.5-flash",
+    "gemini_pro": "gemini-2.5-pro",
+}
+
 
 class LLMManager:
     """Standalone LLM manager for knowledge corpus building"""
@@ -228,8 +235,22 @@ class LLMManager:
             self.openai_available = False
             print("   OpenAI library not installed")
 
+    @staticmethod
+    def _config_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
+
+    def _resolve_gemini_model(self, model_name: Optional[str] = None) -> str:
+        selected = model_name or self.gemini_model_name
+        return self.gemini_models.get(selected, selected)
+
     def _init_gemini(self):
-        """Initialize Gemini client with fallback API keys"""
+        """Initialize Gemini client with Vertex AI or fallback API keys."""
         try:
             from google import genai
             from google.genai import types
@@ -241,27 +262,69 @@ class LLMManager:
 
             # Store types for later use
             self.genai_types = types
+            gemini_config = self.config.get("gemini", {}) or {}
+            configured_models = gemini_config.get("models") or {}
+            self.gemini_models = dict(MODELS)
+            if isinstance(configured_models, dict):
+                self.gemini_models.update(configured_models)
+
+            model_config = gemini_config.get("model", "gemini_flash")
+            self.gemini_model_name = self._resolve_gemini_model(model_config)
+            self.gemini_vertexai = self._config_bool(
+                gemini_config.get("vertexai", gemini_config.get("use_vertexai")),
+            )
+
+            # Track current API key index. Vertex AI mode does not use API keys.
+            self.gemini_api_keys = []
+            self.gemini_current_key_index = 0
+
+            if self.gemini_vertexai:
+                project = (
+                    gemini_config.get("project")
+                    or gemini_config.get("vertex_project")
+                    or os.getenv("GOOGLE_CLOUD_PROJECT")
+                    or os.getenv("GCLOUD_PROJECT")
+                    or VERTEX_PROJECT
+                )
+                location = (
+                    gemini_config.get("location")
+                    or gemini_config.get("vertex_location")
+                    or os.getenv("GOOGLE_CLOUD_LOCATION")
+                    or VERTEX_LOCATION
+                )
+                api_version = gemini_config.get("api_version", "v1")
+
+                self.gemini_client = genai.Client(
+                    vertexai=True,
+                    project=project,
+                    location=location,
+                    http_options=types.HttpOptions(api_version=api_version),
+                )
+                self.gemini_available = True
+                self.gemini_vertex_project = project
+                self.gemini_vertex_location = location
+                print(
+                    "   Gemini Vertex AI client initialized "
+                    f"({project}/{location}, model={self.gemini_model_name})"
+                )
+                return
 
             # Get primary API key from config or environment
             primary_api_key = (
-                self.config.get("gemini", {}).get("api_key") or
+                gemini_config.get("api_key") or
                 os.getenv("GEMINI_API_KEY") or
                 os.getenv("GOOGLE_API_KEY")
             )
-            
+
             # Get fallback API keys from config (support comma-separated string)
-            fallback_keys = self.config.get("gemini", {}).get("fallback_api_keys", [])
+            fallback_keys = gemini_config.get("fallback_api_keys", [])
             if isinstance(fallback_keys, str):
                 fallback_keys = [k.strip() for k in fallback_keys.split(",") if k.strip()]
             
             # Build list of all API keys (primary + fallbacks)
-            self.gemini_api_keys = []
             if primary_api_key:
                 self.gemini_api_keys.append(primary_api_key)
             self.gemini_api_keys.extend(fallback_keys)
-            
-            # Track current API key index
-            self.gemini_current_key_index = 0
 
             if self.gemini_api_keys:
                 # Set initial API key in environment
@@ -269,9 +332,6 @@ class LLMManager:
 
                 # Create client using new API
                 self.gemini_client = genai.Client()
-
-                # Get model name from config
-                self.gemini_model_name = self.config.get("gemini", {}).get("model", "gemini-2.0-flash")
 
                 self.gemini_available = True
                 total_keys = len(self.gemini_api_keys)
@@ -1260,7 +1320,7 @@ class LLMManager:
     #         print("Falling back to standard Gemini call...")
     #         return await self.call_gemini(prompt)
 
-    async def call_gemini(self, prompt: str) -> Optional[str]:
+    async def call_gemini(self, prompt: str, model: Optional[str] = None) -> Optional[str]:
         """Call Gemini API using new google.genai client with types.GenerateContentConfig"""
         if not self.gemini_available:
             raise ValueError("Gemini not available")
@@ -1279,6 +1339,7 @@ class LLMManager:
             top_k=2,
             top_p=0.95,
         )
+        model_name = self._resolve_gemini_model(model)
 
         keys = getattr(self, "gemini_api_keys", []) or []
         max_attempts = max(1, len(keys))
@@ -1288,7 +1349,7 @@ class LLMManager:
                 # Call the new API with the correct format
                 response = await asyncio.to_thread(
                     self.gemini_client.models.generate_content,
-                    model=self.gemini_model_name,
+                    model=model_name,
                     contents=prompt,  # Can pass string directly
                     config=config
                 )
@@ -1380,7 +1441,8 @@ class LLMManager:
     async def call_gemini_vision(
         self,
         prompt: str,
-        image_files: Optional[list] = None
+        image_files: Optional[list] = None,
+        model: Optional[str] = None,
     ) -> Optional[str]:
         """Call Gemini API with vision support
 
@@ -1407,6 +1469,7 @@ class LLMManager:
             top_p=0.95,
             safety_settings=self._build_gemini_safety_settings(),
         )
+        model_name = self._resolve_gemini_model(model)
 
         # Build content with text and images
         content_parts = []
@@ -1429,7 +1492,7 @@ class LLMManager:
                 # Call Gemini with multimodal content
                 response = await asyncio.to_thread(
                     self.gemini_client.models.generate_content,
-                    model=self.gemini_model_name,
+                    model=model_name,
                     contents=content_parts,
                     config=config
                 )
