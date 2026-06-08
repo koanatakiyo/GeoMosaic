@@ -447,11 +447,10 @@ class LLMManager:
             self.deepseek_api_key = api_key
             self.deepseek_base_url = base_url
 
-            default_model = "deepseek-v3.1" if use_dashscope else "deepseek-reasoner"
+            default_model = "deepseek-v3.1" if use_dashscope else "deepseek-chat"
             self.deepseek_model_name = deepseek_config.get("model", default_model)
 
-            default_extra_body = {"enable_thinking": True} if use_dashscope else {"thinking": {"type": "enabled"}}
-            self.deepseek_extra_body = deepseek_config.get("extra_body", default_extra_body)
+            self.deepseek_extra_body = None
             self.deepseek_client = AsyncOpenAI(api_key=api_key, base_url=self.deepseek_base_url)
             self.deepseek_available = True
 
@@ -601,7 +600,7 @@ class LLMManager:
                 self.qwen_base_url = base_url
                 self.qwen_model_name = self.config.get("qwen", {}).get(
                     "model",
-                    "qwen3-next-80b-a3b-instruct"
+                    "qwen3.5-122b-a10b"
                 )
                 self.qwen_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
                 self.qwen_available = True
@@ -636,7 +635,7 @@ class LLMManager:
                 self.doubao_base_url = base_url
                 self.doubao_model_name = self.config.get("doubao", {}).get(
                     "model",
-                    "doubao-seed-2-0-lite-250515"
+                    "doubao-seed-2-0-pro-260215"
                 )
                 self.doubao_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
                 self.doubao_available = True
@@ -652,6 +651,32 @@ class LLMManager:
             self.doubao_available = False
             print(f"   Doubao initialization failed: {e}")
 
+    @staticmethod
+    def _extract_response_text(response: Any) -> str:
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str) and output_text:
+            return output_text
+
+        if isinstance(response, dict):
+            output_text = response.get("output_text")
+            if isinstance(output_text, str) and output_text:
+                return output_text
+            output = response.get("output", [])
+        else:
+            output = getattr(response, "output", [])
+
+        text_parts: list[str] = []
+        for item in output or []:
+            content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", [])
+            for block in content or []:
+                if isinstance(block, dict):
+                    value = block.get("text") or block.get("content")
+                else:
+                    value = getattr(block, "text", None) or getattr(block, "content", None)
+                if isinstance(value, str):
+                    text_parts.append(value)
+        return "".join(text_parts)
+
     async def call_doubao(
         self,
         prompt: str,
@@ -660,27 +685,32 @@ class LLMManager:
         max_tokens: Optional[int] = None,
         model_name: Optional[str] = None,
     ) -> Optional[str]:
-        """Call Doubao (Volcengine Ark) via OpenAI-compatible chat completions API."""
+        """Call Doubao (Volcengine Ark) via the Responses API."""
         if not getattr(self, "doubao_available", False):
             raise ValueError("Doubao not available")
-
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
 
         generation_config = self.config.get("doubao", {}).get("generation", {})
         params = {
             "model": model_name or self.doubao_model_name,
-            "messages": messages,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"{system_prompt}\n\n{prompt}" if system_prompt else prompt,
+                        }
+                    ],
+                }
+            ],
             "temperature": temperature if temperature is not None else generation_config.get("temperature", 0.7),
         }
         if max_tokens is not None:
-            params["max_tokens"] = max_tokens
+            params["max_output_tokens"] = max_tokens
 
         try:
-            response = await self.doubao_client.chat.completions.create(**params)
-            content = response.choices[0].message.content
+            response = await self.doubao_client.responses.create(**params)
+            content = self._extract_response_text(response)
             if not content or not content.strip():
                 raise ValueError(f"Doubao returned empty output (model={params['model']})")
             return content.strip()
@@ -820,7 +850,7 @@ class LLMManager:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     extra_headers=extra_headers or self.config.get("llama", {}).get("extra_headers", {}),
-                    extra_body=extra_body or self.config.get("llama", {}).get("extra_body", {}),
+                    extra_body=extra_body if extra_body is not None else self.config.get("llama", {}).get("extra_body", {}),
                 )
                 content = response.choices[0].message.content if response.choices else None
                 if content is None:
@@ -1320,6 +1350,10 @@ class LLMManager:
     #         print("Falling back to standard Gemini call...")
     #         return await self.call_gemini(prompt)
 
+    async def call_gemini_with_web_search(self, prompt: str) -> Optional[str]:
+        """Stable compatibility fallback for callers that request Gemini web search."""
+        return await self.call_gemini(prompt)
+
     async def call_gemini(self, prompt: str, model: Optional[str] = None) -> Optional[str]:
         """Call Gemini API using new google.genai client with types.GenerateContentConfig"""
         if not self.gemini_available:
@@ -1674,7 +1708,7 @@ class LLMManager:
             generation_config = self.config.get("deepseek", {}).get("generation", {})
             temperature = generation_config.get("temperature", 0)
 
-            payload = {
+            params = {
                 "messages": [
                     {"role": "user", "content": prompt}
                 ],
@@ -1682,24 +1716,10 @@ class LLMManager:
                 "stream": False,
                 "temperature": temperature
             }
-
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.deepseek_api_key}"
-            }
-
-            response = await self.deepseek_client.post(
-                f"{self.deepseek_base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-                timeout=60.0
-            )
-
-            response.raise_for_status()
-            data = response.json()
-            if "choices" in data and data["choices"]:
-                return data["choices"][0]["message"]["content"]
-            raise ValueError(f"Unexpected response format: {data}")
+            response = await self.deepseek_client.chat.completions.create(**params)
+            if response.choices:
+                return response.choices[0].message.content
+            raise ValueError(f"Unexpected response format: {response}")
 
         except Exception as e:
             print(f"DeepSeek API error: {e}")
@@ -1900,32 +1920,19 @@ class LLMManager:
             generation_config = self.config.get("qwen", {}).get("generation", {})
             temperature = generation_config.get("temperature", 0)
 
-            payload = {
+            params = {
                 "messages": [
                     {"role": "user", "content": prompt}
                 ],
                 "model": self.qwen_model_name,
                 "stream": False,
-                "temperature": temperature
+                "temperature": temperature,
+                "extra_body": {"enable_thinking": False},
             }
-
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.qwen_api_key}"
-            }
-
-            response = await self.qwen_client.post(
-                f"{self.qwen_base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-                timeout=60.0
-            )
-
-            response.raise_for_status()
-            data = response.json()
-            if "choices" in data and data["choices"]:
-                return data["choices"][0]["message"]["content"]
-            raise ValueError(f"Unexpected response format: {data}")
+            response = await self.qwen_client.chat.completions.create(**params)
+            if response.choices:
+                return response.choices[0].message.content
+            raise ValueError(f"Unexpected response format: {response}")
 
         except Exception as e:
             print(f"Qwen API error: {e}")

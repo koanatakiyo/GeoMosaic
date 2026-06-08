@@ -231,3 +231,10 @@ tests/test_llm_manager_vertex_gemini.py
 result.md
 script/collect_gdelt_doc_pointers.sh
 script/run_gdelt_doc_overnight.sh
+script/run_e4_all_scorers.sh
+
+
+
+ICDE_geomosaic/
+result.md
+README.md

@@ -7,6 +7,7 @@ passages. Stage C passage judgments remain diagnostic triage only.
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -74,9 +75,11 @@ def claim_text_quality(text: str) -> int:
         return -100
     score = min(len(value), 500)
     lowered = value.lower()
-    for marker in ("parse_fail", "claim ", " evaluated for ", "no mention", "does not mention"):
+    for marker in ("parse_fail", " evaluated for ", "no mention", "does not mention"):
         if marker in lowered:
             score -= 120
+    if re.search(r"\bclaim [A-Z]\d+\b", value):
+        score -= 120
     return score
 
 
@@ -231,6 +234,7 @@ def split_text_chunks(text: str, max_chars: int) -> list[str]:
 def task_for_bundle(bundle: dict[str, Any], scored_vp: str, claims: list[dict[str, Any]], max_chars: int) -> dict[str, Any]:
     task_id = f"direct_score_{bundle['event_id']}_{bundle['source_vp']}_{scored_vp}_{stable_hash(bundle['bundle_text'] + scored_vp)}"
     strategy = "full_text" if len(bundle["bundle_text"]) <= max_chars else "document_map_reduce"
+    chunks = split_text_chunks(bundle["bundle_text"], max_chars) if strategy != "full_text" else []
     return {
         "task_id": task_id,
         "task_type": "direct_scoring",
@@ -243,8 +247,9 @@ def task_for_bundle(bundle: dict[str, Any], scored_vp: str, claims: list[dict[st
         "strategy": strategy,
         "documents": bundle["documents"],
         "bundle_char_count": bundle["bundle_char_count"],
-        "bundle_text": bundle["bundle_text"],
-        "chunks": split_text_chunks(bundle["bundle_text"], max_chars) if strategy != "full_text" else [],
+        "bundle_text_sha256": stable_hash(bundle["bundle_text"]),
+        "bundle_text": bundle["bundle_text"] if strategy == "full_text" else "",
+        "chunks": chunks,
         "claims": [
             {key: claim.get(key) for key in ("claim_id", "claim_text", "max", "source_claim_id", "claim_text_source")}
             for claim in claims
@@ -275,8 +280,9 @@ def build_direct_scoring_tasks(
     claims = apply_score_maxima(claims, load_score_maxima(score_dirs))
     claim_groups = group_claims_by_event_scored_vp(claims)
 
+    bundles = build_document_bundles(docs)
     tasks = []
-    for bundle in build_document_bundles(docs):
+    for bundle in bundles:
         scored_vps = sorted(scored_vp for event_id, scored_vp in claim_groups if event_id == bundle["event_id"])
         for scored_vp in scored_vps:
             tasks.append(task_for_bundle(bundle, scored_vp, claim_groups[(bundle["event_id"], scored_vp)], max_chars=max_bundle_chars))
@@ -292,7 +298,7 @@ def build_direct_scoring_tasks(
         "claims_path": Path(claims_path).as_posix(),
         "protocol": DIRECT_SCORING_PROTOCOL,
         "documents_representative": len(docs),
-        "bundles": len(build_document_bundles(docs)),
+        "bundles": len(bundles),
         "claims": len(claims),
         "tasks": len(tasks),
         "tasks_by_event": dict(sorted(Counter(task["event_id"] for task in tasks).items())),
@@ -342,13 +348,27 @@ def parse_json_object_response(response: str) -> dict[str, Any]:
     value = strip_json_fence(str(response)).strip()
     if value.endswith("```"):
         value = value[:-3].strip()
+    decoder = json.JSONDecoder(strict=False)
     try:
         return json.loads(value)
     except json.JSONDecodeError:
+        try:
+            parsed, _ = decoder.raw_decode(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
         start = value.find("{")
         end = value.rfind("}")
         if start >= 0 and end > start:
-            return json.loads(value[start : end + 1])
+            trimmed = value[start : end + 1]
+            try:
+                return json.loads(trimmed)
+            except json.JSONDecodeError:
+                parsed, _ = decoder.raw_decode(trimmed)
+                if isinstance(parsed, dict):
+                    return parsed
+                raise
         raise
 
 
@@ -444,7 +464,24 @@ def result_rows_for_task(task: dict[str, Any], model_name: str, model_id: str, s
     return rows
 
 
-def existing_completed_task_models(output_path: str | Path) -> set[tuple[str, str]]:
+def existing_completed_task_models(
+    output_path: str | Path,
+    expected_claim_counts: dict[str, int] | None = None,
+) -> set[tuple[str, str]]:
+    if expected_claim_counts:
+        scored_claims: dict[tuple[str, str], set[str]] = defaultdict(set)
+        for row in read_jsonl(output_path):
+            task_id = row.get("task_id")
+            model = row.get("model")
+            claim_id = row.get("claim_id")
+            if task_id and model and claim_id and row.get("score") is not None:
+                scored_claims[(str(task_id), str(model))].add(str(claim_id))
+        return {
+            key
+            for key, claim_ids in scored_claims.items()
+            if len(claim_ids) >= expected_claim_counts.get(key[0], 0)
+        }
+
     completed = set()
     for row in read_jsonl(output_path):
         task_id = row.get("task_id")
@@ -452,6 +489,85 @@ def existing_completed_task_models(output_path: str | Path) -> set[tuple[str, st
         if task_id and model and row.get("score") is not None:
             completed.add((str(task_id), str(model)))
     return completed
+
+
+def compact_direct_scoring_results(output_path: str | Path, backup_path: str | Path | None = None) -> dict[str, Any]:
+    path = Path(output_path)
+    rows = list(read_jsonl(path))
+    last_completed_row_for_claim = {
+        (str(row.get("task_id")), str(row.get("model")), str(row.get("claim_id"))): idx
+        for idx, row in enumerate(rows)
+        if row.get("task_id")
+        and row.get("model")
+        and row.get("claim_id")
+        and row.get("status") != "failed"
+        and row.get("score") is not None
+    }
+    resolved = {
+        (str(row.get("task_id")), str(row.get("model")))
+        for row in rows
+        if row.get("task_id") and row.get("model") and row.get("status") != "failed" and row.get("score") is not None
+    }
+    compacted = []
+    removed_failed = 0
+    removed_duplicate_completed = 0
+    removed_resolved_missing_scores = 0
+    for idx, row in enumerate(rows):
+        key = (str(row.get("task_id")), str(row.get("model")))
+        if row.get("status") == "failed" and key in resolved:
+            removed_failed += 1
+            continue
+        completed_claim_key = (str(row.get("task_id")), str(row.get("model")), str(row.get("claim_id")))
+        if (
+            row.get("status") != "failed"
+            and row.get("score") is None
+            and completed_claim_key in last_completed_row_for_claim
+        ):
+            removed_resolved_missing_scores += 1
+            continue
+        if (
+            row.get("status") != "failed"
+            and row.get("score") is not None
+            and completed_claim_key in last_completed_row_for_claim
+            and idx != last_completed_row_for_claim[completed_claim_key]
+        ):
+            removed_duplicate_completed += 1
+            continue
+        compacted.append(row)
+
+    if backup_path is not None and path.exists():
+        Path(backup_path).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    write_jsonl(path, compacted)
+    return {
+        "output_path": path.as_posix(),
+        "rows_before": len(rows),
+        "rows_after": len(compacted),
+        "removed_failed_rows": removed_failed,
+        "removed_duplicate_completed_rows": removed_duplicate_completed,
+        "removed_resolved_missing_score_rows": removed_resolved_missing_scores,
+    }
+
+
+def reset_direct_scoring_model_rows(
+    output_path: str | Path,
+    models: set[str],
+    backup_path: str | Path,
+) -> dict[str, Any]:
+    path = Path(output_path)
+    rows = list(read_jsonl(path))
+    wanted = {str(model) for model in models}
+    removed = [row for row in rows if str(row.get("model", "")) in wanted]
+    kept = [row for row in rows if str(row.get("model", "")) not in wanted]
+    write_jsonl(backup_path, removed)
+    write_jsonl(path, kept)
+    return {
+        "output_path": path.as_posix(),
+        "backup_path": Path(backup_path).as_posix(),
+        "models": sorted(wanted),
+        "rows_before": len(rows),
+        "removed_rows": len(removed),
+        "kept_rows": len(kept),
+    }
 
 
 def execute_direct_scoring(
@@ -469,7 +585,8 @@ def execute_direct_scoring(
     wanted = csv_values(task_ids)
     tasks = [row for row in read_jsonl(tasks_path) if not wanted or str(row.get("task_id", "")) in wanted]
     selected = tasks[:limit] if limit is not None else tasks
-    existing = existing_completed_task_models(output_path) if resume else set()
+    expected_claim_counts = {str(task.get("task_id", "")): len(task.get("claims", [])) for task in tasks}
+    existing = existing_completed_task_models(output_path, expected_claim_counts=expected_claim_counts) if resume else set()
 
     attempted = completed = failed = skipped_existing = llm_calls = 0
     for task in selected:

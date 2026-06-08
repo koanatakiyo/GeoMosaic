@@ -18,22 +18,31 @@ from llm_manager import LLMManager  # noqa: E402
 
 
 DEFAULT_MODEL_IDS = {
-    "gemini": "gemini-2.5-pro",
     "openai": "gpt-5-mini",
     "grok": "grok-4-1-fast",
     "llama": "meta-llama/llama-4-scout",
-    "doubao": "doubao-seed",
+    "doubao": "doubao-seed-2-0-pro-260215",
     "deepseek": "deepseek-chat",
-    "qwen": "qwen3.5-122b",
+    "qwen": "qwen3.5-122b-a10b",
 }
 
 
-def build_model_caller(manager: LLMManager, provider: str):
+def provider_available(manager: LLMManager, provider: str) -> bool:
+    attr = f"{provider}_available"
+    return bool(getattr(manager, attr, False))
+
+
+def provider_unavailable_message(provider: str) -> str:
+    if provider in {"openai", "deepseek", "qwen", "doubao", "llama"}:
+        return f"{provider} provider is unavailable. Check API key/config and install the openai package if this is an OpenAI-compatible provider."
+    return f"{provider} provider is unavailable. Check API key/config and required client package."
+
+
+def build_model_caller(manager: LLMManager, provider: str, max_output_tokens: int = 16000):
     async def call_async(prompt: str, model_id: str) -> str:
-        if provider == "gemini":
-            return await manager.call_gemini(prompt, model=model_id) or ""
         if provider == "openai":
             manager.config.setdefault("openai", {})["model"] = {"text": model_id}
+            manager.config.setdefault("openai", {})["max_tokens"] = max_output_tokens
             return await manager.call_openai(prompt, model=model_id) or ""
         if provider == "grok":
             manager.grok_model_name = model_id
@@ -42,11 +51,12 @@ def build_model_caller(manager: LLMManager, provider: str):
             return await manager.call_llama_chat(
                 [{"role": "user", "content": prompt}],
                 temperature=0,
-                max_tokens=8192,
+                max_tokens=max_output_tokens,
                 model_name=model_id,
+                extra_body={},
             ) or ""
         if provider == "doubao":
-            return await manager.call_doubao(prompt, temperature=0, max_tokens=8192, model_name=model_id) or ""
+            return await manager.call_doubao(prompt, temperature=0, max_tokens=max_output_tokens, model_name=model_id) or ""
         if provider == "deepseek":
             manager.deepseek_model_name = model_id
             return await manager.call_deepseek(prompt) or ""
@@ -55,8 +65,10 @@ def build_model_caller(manager: LLMManager, provider: str):
             return await manager.call_qwen(prompt) or ""
         raise ValueError(f"Unsupported provider: {provider}")
 
+    loop = asyncio.new_event_loop()
+
     def call(prompt: str, model_id: str) -> str | dict[str, Any]:
-        return asyncio.run(call_async(prompt, model_id))
+        return loop.run_until_complete(call_async(prompt, model_id))
 
     return call
 
@@ -77,17 +89,20 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
+    parser.add_argument("--max-output-tokens", type=int, default=16000)
     args = parser.parse_args()
 
     model_id = args.model_id or DEFAULT_MODEL_IDS[args.model]
     manager = LLMManager(models_to_init=[args.model])
+    if not provider_available(manager, args.model):
+        raise SystemExit(provider_unavailable_message(args.model))
     summary = execute_direct_scoring(
         tasks_path=args.tasks,
         output_path=args.output,
         summary_path=args.summary,
         model_name=args.model,
         model_id=model_id,
-        model_caller=build_model_caller(manager, args.model),
+        model_caller=build_model_caller(manager, args.model, max_output_tokens=args.max_output_tokens),
         resume=not args.no_resume,
         limit=args.limit,
         task_ids=args.task_ids,

@@ -30,13 +30,14 @@ def _package(
     candidate_count: int,
     seed_count: int,
     name: str,
+    expanded_count: int | None = None,
 ) -> dict[str, Any]:
     return {
         "method": name,
         "query": query,
         "candidate_count": candidate_count,
         "seed_count": seed_count,
-        "expanded_count": seed_count,
+        "expanded_count": seed_count if expanded_count is None else expanded_count,
         "objective_value": None,
         "selected_hyperedges": selected,
         "induced_assets": induced_assets(index, selected),
@@ -58,11 +59,20 @@ def metadata_filter(index: SMPI, query: str, config: BPEConfig) -> dict[str, Any
     return _package(index, query, selected, len(candidates), len(seeds), "Metadata++")
 
 
-def metadata_mmr(index: SMPI, query: str, config: BPEConfig, lambda_rel: float = 0.65) -> dict[str, Any]:
-    candidates, seeds = _base_candidates(index, query, config)
-    remaining = {h["hyperedge_id"]: h for h in seeds}
+def _ensure_relevance(index: SMPI, query: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        if "_rel" not in item and hasattr(index, "relevance"):
+            item["_rel"] = index.relevance(query, item)
+        out.append(item)
+    return out
+
+
+def _mmr_select(candidates: list[dict[str, Any]], budget: int, lambda_rel: float) -> list[dict[str, Any]]:
+    remaining = {h["hyperedge_id"]: h for h in candidates}
     selected: list[dict[str, Any]] = []
-    while remaining and len(selected) < config.hyperedge_budget:
+    while remaining and len(selected) < budget:
         def mmr_score(h: dict[str, Any]) -> tuple[float, float, str]:
             rel = float(h.get("_rel", h.get("confidence", 0.0)) or 0.0)
             if not selected:
@@ -75,7 +85,29 @@ def metadata_mmr(index: SMPI, query: str, config: BPEConfig, lambda_rel: float =
         best = max(remaining.values(), key=mmr_score)
         selected.append(best)
         remaining.pop(best["hyperedge_id"], None)
+    return selected
+
+
+def metadata_mmr(index: SMPI, query: str, config: BPEConfig, lambda_rel: float = 0.65) -> dict[str, Any]:
+    candidates, seeds = _base_candidates(index, query, config)
+    selected = _mmr_select(seeds, config.hyperedge_budget, lambda_rel)
     return _package(index, query, selected, len(candidates), len(seeds), "Metadata++ + MMR")
+
+
+def smpi_expanded_mmr(index: SMPI, query: str, config: BPEConfig, lambda_rel: float = 0.65) -> dict[str, Any]:
+    candidates, seeds = _base_candidates(index, query, config)
+    expanded = index.expand_seeds(seeds, candidates, config.expansion_depth)
+    expanded = _ensure_relevance(index, query, expanded)
+    selected = _mmr_select(expanded, config.hyperedge_budget, lambda_rel)
+    return _package(
+        index,
+        query,
+        selected,
+        len(candidates),
+        len(seeds),
+        "SMPI-Expanded + MMR",
+        expanded_count=len(expanded),
+    )
 
 
 def random_sm(index: SMPI, query: str, config: BPEConfig, seed: int = 13) -> dict[str, Any]:
@@ -101,6 +133,7 @@ def run_baselines(index: SMPI, query: str, config: BPEConfig) -> dict[str, dict[
         "NaiveRAG": naive_rag(index, query, config),
         "Metadata++": metadata_filter(index, query, config),
         "Metadata++ + MMR": metadata_mmr(index, query, config),
+        "SMPI-Expanded + MMR": smpi_expanded_mmr(index, query, config),
         "Random-SM": random_sm(index, query, config),
     }
 
